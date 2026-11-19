@@ -37,13 +37,22 @@ class RateLimitPlugin(base_plugin.BasePlugin):
         now = time.time()
         window = self.user_windows[user_id]
 
-        # TODO: Implement sliding window:
-        # 1. Pop timestamps older than (now - window_seconds) from the left
-        # 2. If len(window) >= max_requests:
-        #       wait = window_seconds - (now - window[0])
-        #       self.blocked_count += 1
-        #       return self._block_response(
-        #           f"Rate limit exceeded. Try again in {wait:.0f}s."
-        #       )
-        # 3. Else: append now, return None
-        raise NotImplementedError("Implement RateLimitPlugin.on_user_message_callback")
+        # 1. Slide the window: drop timestamps older than (now - window_seconds)
+        cutoff = now - self.window_seconds
+        while window and window[0] <= cutoff:
+            window.popleft()
+
+        # 2. Over the limit -> block WITHOUT calling the LLM. A blocked request
+        #    is not recorded, so a spamming user is not locked out forever.
+        if len(window) >= self.max_requests:
+            wait = max(0.0, self.window_seconds - (now - window[0]))
+            self.blocked_count += 1
+            return self._block_response(
+                f"Rate limit exceeded. Try again in {wait:.0f}s. "
+                f"Bạn đã gửi quá {self.max_requests} yêu cầu trong "
+                f"{self.window_seconds} giây, vui lòng thử lại sau."
+            )
+
+        # 3. Under the limit -> record this request and let it through
+        window.append(now)
+        return None

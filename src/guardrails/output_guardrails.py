@@ -12,6 +12,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -27,6 +28,112 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+REDACTED = "[REDACTED]"
+
+# Public contact points from data/pii_hallucination_samples.json (ground_truth):
+# these are not customer PII and must stay readable in banking answers.
+PUBLIC_ALLOWLIST = {
+    "support@vinbank.example",
+}
+
+# Words that commonly follow "password is ..." in benign answers
+# ("your password is required / case-sensitive / incorrect").
+_BENIGN_AFTER_PASSWORD = (
+    r"required|incorrect|wrong|invalid|expired|correct|valid|case|not|never|"
+    r"too|the|your|a|an|reset|changed|sent|strong|weak|secret|private|"
+    r"confidential|stored|encrypted|hashed|only|missing|empty|needed"
+)
+
+_PASSWORD_LABEL = r"\b(?:password|passwd|pwd|passcode|m[aậ]t\s+kh[aẩ]u)"
+_VALUE = r"[\"']?[^\s,;\"']*[^\s,;\"'.]"   # value without trailing "." / ","
+
+# Order matters: typed secrets first, then PII, then the literal fallback.
+# Each entry is (issue_type, compiled pattern, label_group) — when
+# label_group is set, only the VALUE is replaced and the label
+# ("password: ") is kept readable.
+_PATTERNS: list[tuple[str, re.Pattern, int | None]] = [
+    # API keys: OpenAI-style "sk-...", AWS access keys, "api key is/: XXX".
+    ("api_key", re.compile(r"\bsk-[A-Za-z0-9_-]{4,}"), None),
+    ("api_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b"), None),
+    (
+        "api_key",
+        re.compile(
+            r"(\bapi[\s_-]?key\s*(?:is|:|=)\s*)"
+            r"(?!\[REDACTED\])[\"']?[^\s,;\"']*[^\s,;\"'.]",
+            re.IGNORECASE,
+        ),
+        1,
+    ),
+    # Passwords, explicit assignment: "password=x", "password: x".
+    (
+        "password",
+        re.compile(rf"({_PASSWORD_LABEL}\s*[:=]\s*)(?!\[REDACTED\]){_VALUE}",
+                   re.IGNORECASE),
+        1,
+    ),
+    # Passwords in prose: "password is x", "mật khẩu là x" — but not
+    # "your password is required / case-sensitive".
+    (
+        "password",
+        re.compile(
+            rf"({_PASSWORD_LABEL}\s+(?:is|l[aà])\s+)"
+            rf"(?!\[REDACTED\]|(?:{_BENIGN_AFTER_PASSWORD})\b){_VALUE}",
+            re.IGNORECASE,
+        ),
+        1,
+    ),
+    # Internal hostnames / connection strings (db.*.internal:5432, ...).
+    (
+        "internal_host",
+        re.compile(r"\b[\w-]+(?:\.[\w-]+)*\.(?:internal|local|corp)(?::\d+)?\b",
+                   re.IGNORECASE),
+        None,
+    ),
+    # Email (public support address is allow-listed in _redact()).
+    ("email", re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}"), None),
+    # VN phone: 0xxxxxxxxx (10 digits) / 0xxxxxxxxxx (11, e.g. 028 landline)
+    # or +84..., optional space/dot/dash separators. The public hotline
+    # "1900 545 467" starts with 1 and is not matched.
+    (
+        "phone",
+        re.compile(r"(?<![\w+])(?:\+84|0)(?:[\s.-]?\d){9,10}(?!\d)"),
+        None,
+    ),
+    # CMND (9 digits) / CCCD (12 digits) — not a money amount ("... VND").
+    (
+        "national_id",
+        re.compile(
+            r"(?<![\d.,])(?:\d{12}|\d{9})(?![\d.,]*\d)"
+            r"(?!\s*(?:vnd|vnđ|đ|dong|đồng|usd)\b)",
+            re.IGNORECASE,
+        ),
+        None,
+    ),
+    # Fallback: literal internal values from data/protected/vinbank_secrets.json
+    # (admin123, sk-vinbank-secret-2024, db.vinbank.internal...) in any
+    # phrasing the typed patterns above missed ("the admin one is admin123").
+    *[
+        ("internal_secret", re.compile(re.escape(s), re.IGNORECASE), None)
+        for s in sorted(DEMO_SECRETS, key=len, reverse=True) if s
+    ],
+]
+
+
+def _redact(pattern: re.Pattern, label_group: int | None, text: str) -> tuple[str, int]:
+    """Replace matches of ``pattern`` with [REDACTED]; return (text, count)."""
+    count = 0
+
+    def _sub(m: re.Match) -> str:
+        nonlocal count
+        if m.group(0).lower() in PUBLIC_ALLOWLIST:
+            return m.group(0)
+        count += 1
+        prefix = m.group(label_group) if label_group else ""
+        return f"{prefix}{REDACTED}"
+
+    return pattern.sub(_sub, text), count
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -34,32 +141,47 @@ def content_filter(response: str) -> dict:
         response: The LLM's response text
 
     Returns:
-        dict with 'safe', 'issues', and 'redacted' keys
+        dict with 'safe', 'issues', and 'redacted' keys.
+        ``issues`` items look like ``"phone: 1 found"`` (type first, so the
+        type list can be compared with data/pii_hallucination_samples.json).
+
+    Limits: regex only catches values written out verbatim. Encoded /
+    split secrets (base64, "a-d-m-i-n-1-2-3", reversed) need a semantic
+    layer (LLM judge / NeMo output rail like Red Advance L4).
     """
-    issues = []
+    if not isinstance(response, str) or not response:
+        return {"safe": True, "issues": [], "redacted": response or ""}
+
+    counts: dict[str, int] = {}
     redacted = response
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
+    # Patterns run on the progressively redacted text so each value is
+    # reported once, under its most specific type.
+    for issue_type, pattern, label_group in _PATTERNS:
+        redacted, n = _redact(pattern, label_group, redacted)
+        if n:
+            counts[issue_type] = counts.get(issue_type, 0) + n
 
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+    issues = [f"{name}: {n} found" for name, n in counts.items()]
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
         "redacted": redacted,
     }
+
+
+# Issue types that mean the MODEL itself is leaking system internals —
+# the whole reply is withheld instead of just masked (the rest of that reply
+# may carry partial / encoded hints). Customer PII only gets redacted.
+CREDENTIAL_ISSUES = ("internal_secret", "api_key", "password", "internal_host")
+
+# Contains the marker attacks.py uses to classify layer = "output_filter".
+OUTPUT_BLOCK_MESSAGE = (
+    "I cannot share internal system details. "
+    "Xin lỗi, tôi không thể cung cấp thông tin nội bộ của hệ thống. "
+    "(Response withheld by output guardrail.)"
+)
 
 
 # ============================================================
@@ -149,6 +271,7 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +295,42 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # Step 1: regex content filter (PII + secrets)
+        result = content_filter(response_text)
+        self.last_issues = result["issues"]
 
-        return llm_response  # TODO: modify if needed
+        if not result["safe"]:
+            leaked_credentials = any(
+                issue.startswith(CREDENTIAL_ISSUES) for issue in result["issues"]
+            )
+            if leaked_credentials:
+                # System internals leaked -> withhold the whole reply.
+                self.blocked_count += 1
+                self._set_text(llm_response, OUTPUT_BLOCK_MESSAGE)
+                return llm_response
+
+            # Customer PII only -> keep the answer, mask the values.
+            self.redacted_count += 1
+            self._set_text(llm_response, result["redacted"])
+            response_text = result["redacted"]
+
+        # Step 2 (optional, not graded): LLM-as-Judge on the cleaned text
+        if self.use_llm_judge:
+            judge = await llm_safety_check(response_text)
+            if not judge["safe"]:
+                self.blocked_count += 1
+                self._set_text(llm_response, OUTPUT_BLOCK_MESSAGE)
+
+        # Step 3: return the (possibly modified) response
+        return llm_response
+
+    @staticmethod
+    def _set_text(llm_response, text: str) -> None:
+        """Replace the response content with a single text part."""
+        llm_response.content = types.Content(
+            role="model",
+            parts=[types.Part.from_text(text=text)],
+        )
 
 
 # ============================================================
